@@ -112,6 +112,36 @@ def collect_files(
         dirs[:] = [d for d in dirs if not is_out_or_ignored(root, d)]
 
 
+def _load_data_from_outs(index, prefix, outs):
+    for out in outs:
+        if not out.use_cache:
+            continue
+
+        ws, key = out.index_key
+
+        entry = out.get_entry()
+
+        if out.files:
+            from dvc_data.hashfile.tree import Tree
+            from dvc_data.index import DataIndexEntry
+
+            tree = Tree.from_list(out.files, hash_name=out.hash_name)
+            for ikey, (meta, hash_info) in tree.iteritems():
+                ientry = DataIndexEntry(
+                    key=(*prefix, ws, *key, *ikey),
+                    meta=meta,
+                    hash_info=hash_info,
+                )
+                index.add(ientry)
+            entry.loaded = True
+
+        # FIXME PyGTrie-based DataIndex doesn't remove entry.key during
+        # index.add, so we have to set the entry manually here to make
+        # index.view() work correctly.
+        entry.key = key
+        index[(*prefix, ws, *key)] = entry
+
+
 class Index:
     def __init__(
         self,
@@ -282,42 +312,85 @@ class Index:
         return dict(by_workspace)
 
     @cached_property
-    def data(self) -> "Dict[str, DataIndex]":
-        from collections import defaultdict
+    def data_tree(self):
+        from dvc_data.hashfile import Tree
 
-        from dvc.config import NoRemoteError
-        from dvc_data.index import DataIndex, Storage
-
-        by_workspace: dict = defaultdict(DataIndex)
-
-        by_workspace["repo"] = DataIndex()
-        by_workspace["local"] = DataIndex()
-
+        tree = Tree()
         for out in self.outs:
             if not out.use_cache:
                 continue
 
-            workspace, key = out.index_key
-            data_index = by_workspace[workspace]
+            ws, key = out.index_key
 
-            entry = out.get_entry()
-            entry.key = key
-            data_index.add(entry)
+            tree.add((ws, *key), out.meta, out.hash_info)
 
-            storage = Storage(odb=out.odb)
-            try:
-                storage.remote = self.repo.cloud.get_remote_odb(out.remote)
-            except NoRemoteError:
-                pass
+        tree.digest()
 
-            if out.stage.is_import and not out.stage.is_repo_import:
-                dep = out.stage.deps[0]
-                storage.fs = dep.fs
-                storage.path = dep.fs_path
+        return tree
 
-            data_index.storage_map[key] = storage
+    @cached_property
+    def data(self) -> "Dict[str, DataIndex]":
+        import os
 
-        return dict(by_workspace)
+        from appdirs import user_cache_dir
+        from fsspec.utils import tokenize
+
+        from dvc.config import NoRemoteError
+        from dvc_data.index import DataIndex, Storage
+
+        prefix: "DataIndexKey"
+        loaded = False
+
+        cache_dir = user_cache_dir(self.repo.config.APPNAME, self.repo.config.APPAUTHOR)
+        index_dir = os.path.join(
+            cache_dir,
+            "index",
+            "data",
+            # scm.root_dir and repo.root_dir don't match for subrepos
+            tokenize((self.repo.scm.root_dir, self.repo.root_dir)),
+        )
+        os.makedirs(index_dir, exist_ok=True)
+
+        index = DataIndex.open(os.path.join(index_dir, "db.db"))
+        prefix = (self.data_tree.hash_info.value,)
+        if prefix in index.ls((), detail=False):
+            loaded = True
+
+        try:
+            if not loaded:
+                _load_data_from_outs(index, prefix, self.outs)
+                index.commit()
+
+            by_workspace = {}
+            by_workspace["repo"] = index.view((*prefix, "repo"))
+            by_workspace["local"] = index.view((*prefix, "local"))
+
+            for out in self.outs:
+                if not out.use_cache:
+                    continue
+
+                ws, key = out.index_key
+                if ws not in by_workspace:
+                    by_workspace[ws] = index.view((*prefix, ws))
+
+                data_index = by_workspace[ws]
+
+                storage = Storage(odb=out.odb)
+                try:
+                    storage.remote = self.repo.cloud.get_remote_odb(out.remote)
+                except NoRemoteError:
+                    pass
+
+                if out.stage.is_import and not out.stage.is_repo_import:
+                    dep = out.stage.deps[0]
+                    storage.fs = dep.fs
+                    storage.path = dep.fs_path
+
+                data_index.storage_map[key] = storage
+
+            return by_workspace
+        finally:
+            index.close()
 
     @staticmethod
     def _hash_targets(
